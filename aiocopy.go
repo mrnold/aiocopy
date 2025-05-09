@@ -111,7 +111,7 @@ func (sink *VDDKFileSink) ZeroRange(offset int64, length int64) error {
 
 	if err != nil { // Fall back to regular pwrite
 		fmt.Printf("%s Unable to zero range %d - %d on destination, falling back to pwrite: %v\n", time.Now().Format(time.StampNano), offset, offset+length, err)
-		//fmt.Printf("%s MARK: Unable to zero range %d - %d on destination, avoiding write for test %v\n", time.Now().Format(time.StampNano), offset, offset+length, err)
+		//fmt.Printf("%s Unable to zero range %d - %d on destination, avoiding write for test %v\n", time.Now().Format(time.StampNano), offset, offset+length, err)
 		//return nil
 		err = nil
 		count := int64(0)
@@ -181,6 +181,7 @@ type NbdOperations interface {
 	BlockStatus(uint64, uint64, libnbd.ExtentCallback, *libnbd.BlockStatusOptargs) error
 	Poll(timeout int) (uint, error)
 	AioCommandCompleted(uint64) (bool, error)
+	AioInFlight() (uint, error)
 }
 
 // BlockStatusData holds zero/hole status for one block of data
@@ -191,9 +192,11 @@ type BlockStatusData struct {
 }
 
 type AioBlockStatusResult struct {
-	blocks *[]*BlockStatusData
-	err    error
-	ready  bool
+	blocks  *[]*BlockStatusData
+	err     error
+	ready   bool
+	started time.Time
+	taken   time.Duration
 }
 
 type AioReadResult struct {
@@ -212,7 +215,7 @@ func CreateBlockUpdateCallback() (*[]*BlockStatusData, func(string, uint64, []ui
 
 	// Callback for libnbd.BlockStatus. Needs to modify blocks list above.
 	updateBlocksCallback := func(metacontext string, nbdOffset uint64, extents []uint32, err *int) int {
-		fmt.Printf("%s MARK: updating %d blocks %p: %v\n", time.Now().Format(time.StampNano), len(extents), &blocks, extents)
+		fmt.Printf("%s updating %d blocks %p: %v\n", time.Now().Format(time.StampNano), len(extents), &blocks, extents)
 		if nbdOffset > math.MaxInt64 {
 			fmt.Printf("%s Block status offset too big for conversion: 0x%x\n", time.Now().Format(time.StampNano), nbdOffset)
 			return -2
@@ -234,13 +237,13 @@ func CreateBlockUpdateCallback() (*[]*BlockStatusData, func(string, uint64, []ui
 		for i := 0; i < len(extents); i += 2 {
 			length, flags := int64(extents[i]), extents[i+1]
 			if len(blocks) > 0 {
-				fmt.Printf("%s MARK: update blocks current length %d\n", time.Now().Format(time.StampNano), len(blocks))
+				fmt.Printf("%s update blocks current length %d\n", time.Now().Format(time.StampNano), len(blocks))
 				last := len(blocks) - 1
 				lastBlock := blocks[last]
 				lastFlags := lastBlock.Flags
 				lastOffset := lastBlock.Offset + lastBlock.Length
 				if lastFlags == flags && lastOffset == offset {
-					fmt.Printf("%s MARK: merging with previous block offset %d length %d\n", time.Now().Format(time.StampNano), offset, length)
+					fmt.Printf("%s merging with previous block offset %d length %d\n", time.Now().Format(time.StampNano), offset, length)
 					// Merge with previous block
 					blocks[last] = &BlockStatusData{
 						Offset: lastBlock.Offset,
@@ -248,11 +251,11 @@ func CreateBlockUpdateCallback() (*[]*BlockStatusData, func(string, uint64, []ui
 						Flags:  lastFlags,
 					}
 				} else {
-					fmt.Printf("%s MARK: adding full block offset %d length %d\n", time.Now().Format(time.StampNano), offset, length)
+					fmt.Printf("%s adding full block offset %d length %d\n", time.Now().Format(time.StampNano), offset, length)
 					blocks = append(blocks, &BlockStatusData{Offset: offset, Length: length, Flags: flags})
 				}
 			} else {
-				fmt.Printf("%s MARK: update empty blocks list offset %d length %d\n", time.Now().Format(time.StampNano), offset, length)
+				fmt.Printf("%s update empty blocks list offset %d length %d\n", time.Now().Format(time.StampNano), offset, length)
 				blocks = append(blocks, &BlockStatusData{Offset: offset, Length: length, Flags: flags})
 			}
 			offset += length
@@ -264,23 +267,25 @@ func CreateBlockUpdateCallback() (*[]*BlockStatusData, func(string, uint64, []ui
 }
 
 func CreateBlockStatusArguments(blocks *[]*BlockStatusData) (*AioBlockStatusResult, *libnbd.AioBlockStatusOptargs) {
-	fmt.Printf("%s MARK: blocks from create blockstatusarguments: 0x%p 0x%p 0x%p\n", time.Now().Format(time.StampNano), &blocks, blocks, *blocks)
+	fmt.Printf("%s blocks from create blockstatusarguments: 0x%p 0x%p 0x%p\n", time.Now().Format(time.StampNano), &blocks, blocks, *blocks)
 	if blocks == nil {
 		return nil, nil
 	}
 	result := AioBlockStatusResult{
-		blocks: blocks,
-		ready:  false,
-		err:    nil,
+		blocks:  blocks,
+		ready:   false,
+		err:     nil,
+		started: time.Now(),
 	}
 	completionCallback := func(error *int) int {
 		if *error != 0 {
-			fmt.Printf("%s MARK: error in block status completion callback: %d\n\n", time.Now().Format(time.StampNano), *error)
+			fmt.Printf("%s error in block status completion callback: %d\n\n", time.Now().Format(time.StampNano), *error)
 			result.err = syscall.Errno(*error)
 			return -1
 		}
-		fmt.Printf("%s MARK: successfully completed block status command %d blocks included (0x%p)\n", time.Now().Format(time.StampNano), len(*result.blocks), &(result.blocks))
 		result.ready = true
+		result.taken = time.Since(result.started)
+		fmt.Printf("%s successfully completed block status command %d blocks included (0x%p) time taken %s\n", time.Now().Format(time.StampNano), len(*result.blocks), &(result.blocks), result.taken)
 		return 1
 	}
 	return &result, &libnbd.AioBlockStatusOptargs{
@@ -297,13 +302,13 @@ func CreatePreadArguments(result *AioReadResult) *libnbd.AioPreadOptargs {
 	}
 	completionCallback := func(error *int) int {
 		if *error != 0 {
-			fmt.Printf("%s MARK: error in pread callback: %d\n", time.Now().Format(time.StampNano), *error)
+			fmt.Printf("%s error in pread callback: %d\n", time.Now().Format(time.StampNano), *error)
 			result.err = syscall.Errno(*error)
 			return -1
 		}
 		// NBD pread is all or nothing, so shouldn't need to split up results based on how much was actually read
 		result.ready = true
-		fmt.Printf("%s MARK: successfully completed pread at %d len %d, (0x%p)\n", time.Now().Format(time.StampNano), result.offset, result.length, &result.buffer)
+		fmt.Printf("%s successfully completed pread at %d len %d, (0x%p)\n", time.Now().Format(time.StampNano), result.offset, result.length, &result.buffer)
 		return 1
 	}
 	return &libnbd.AioPreadOptargs{
@@ -322,22 +327,22 @@ func AioCopyRange(handle NbdOperations, sink VDDKDataSink, rangeStart, rangeLeng
 	// Read request tracking
 	readCommands := []uint64{}
 	readResults := map[uint64]*AioReadResult{}
-	readDepth := 4 // Maximum concurrent downloads
+	readDepth := 8 // Maximum concurrent downloads
 
 	// Block status tracking
 	statusCommands := []uint64{}                        // Queue of block status command cookies
 	statusResults := map[uint64]*AioBlockStatusResult{} // Map of block status command cookies to results
 
 	for {
-		fmt.Printf("%s MARK: start polling loop, status queue %d, read queue %d, status offset %d\n", time.Now().Format(time.StampNano), len(statusCommands), len(readCommands), statusOffset)
+		fmt.Printf("%s start polling loop, status queue %d, read queue %d, status offset %d\n", time.Now().Format(time.StampNano), len(statusCommands), len(readCommands), statusOffset)
 
 		// Block status
 		if len(statusCommands) < 1 && statusOffset < uint64(rangeEnd) { // Make sure one block status command is always running. Only one at a time because the NBD server might not return the exact requested length, so the next block status starting offset depends on the result of this one
 			blocks, updateBlocksCallback := CreateBlockUpdateCallback()
-			fmt.Printf("%s MARK: updating blocks 0x%p: %v\n", time.Now().Format(time.StampNano), blocks, blocks)
+			fmt.Printf("%s updating blocks 0x%p: %v\n", time.Now().Format(time.StampNano), blocks, blocks)
 			result, blockStatusArguments := CreateBlockStatusArguments(blocks)
 
-			fmt.Printf("%s MARK: issuing AIO block status length %d offset %d\n", time.Now().Format(time.StampNano), statusLength, statusOffset)
+			fmt.Printf("%s issuing AIO block status length %d offset %d\n", time.Now().Format(time.StampNano), statusLength, statusOffset)
 			command, err := handle.AioBlockStatus(statusLength, statusOffset, updateBlocksCallback, blockStatusArguments)
 			if err != nil {
 				return err
@@ -352,7 +357,7 @@ func AioCopyRange(handle NbdOperations, sink VDDKDataSink, rangeStart, rangeLeng
 				lastBlock := (*lastStatusResult.blocks)[len(*lastStatusResult.blocks)-1]
 				statusOffset = uint64(lastBlock.Offset + lastBlock.Length)
 				statusLength = uint64(min(uint64(rangeEnd)-statusOffset, MaxBlockStatusLength))
-				fmt.Printf("%s MARK: AIO status ready, advance offset %d length %d\n", time.Now().Format(time.StampNano), statusOffset, statusLength)
+				fmt.Printf("%s AIO status ready, advance offset %d length %d\n", time.Now().Format(time.StampNano), statusOffset, statusLength)
 			}
 		}
 
@@ -364,11 +369,11 @@ func AioCopyRange(handle NbdOperations, sink VDDKDataSink, rangeStart, rangeLeng
 					return statusResults[statusCommand].err
 				}
 				if statusResults[statusCommand].ready { // Block status command is ready! Issue some reads
-					fmt.Printf("%s MARK: AIO block status command ready! Inspecting returned blocks %p: %v\n", time.Now().Format(time.StampNano), &(statusResults[statusCommand].blocks), statusResults[statusCommand].blocks)
+					fmt.Printf("%s AIO block status command ready! Inspecting returned blocks %p: %v\n", time.Now().Format(time.StampNano), &(statusResults[statusCommand].blocks), statusResults[statusCommand].blocks)
 					block := (*statusResults[statusCommand].blocks)[0]
 
 					if (block.Flags & (libnbd.STATE_ZERO | libnbd.STATE_HOLE)) != 0 { // If the range is empty, add a fake result for the write out later
-						fmt.Printf("%s MARK: spoofing read command for empty range\n", time.Now().Format(time.StampNano))
+						fmt.Printf("%s spoofing read command for empty range\n", time.Now().Format(time.StampNano))
 						result := AioReadResult{
 							length: block.Length,
 							offset: uint64(block.Offset),
@@ -398,7 +403,7 @@ func AioCopyRange(handle NbdOperations, sink VDDKDataSink, rangeStart, rangeLeng
 						result.length = int64(readSize)
 						result.offset = uint64(block.Offset)
 						readArguments := CreatePreadArguments(&result)
-						fmt.Printf("%s MARK: issuing AIO pread at offset %d length %d\n", time.Now().Format(time.StampNano), result.offset, result.length)
+						fmt.Printf("%s issuing AIO pread at offset %d length %d\n", time.Now().Format(time.StampNano), result.offset, result.length)
 						readCommand, err = handle.AioPread(result.buffer, result.offset, readArguments)
 						if err != nil {
 							return err
@@ -406,27 +411,27 @@ func AioCopyRange(handle NbdOperations, sink VDDKDataSink, rangeStart, rangeLeng
 						readCommands = append(readCommands, readCommand)
 						readResults[readCommand] = &result
 
-						fmt.Printf("%s MARK: advancing block, offset %d len %d bump %d bytes\n", time.Now().Format(time.StampNano), block.Offset, block.Length, readSize)
+						fmt.Printf("%s advancing block, offset %d len %d bump %d bytes\n", time.Now().Format(time.StampNano), block.Offset, block.Length, readSize)
 						block.Offset = block.Offset + int64(readSize)
 						block.Length = block.Length - int64(readSize)
-						fmt.Printf("%s MARK: resized block: offset %d len %d\n", time.Now().Format(time.StampNano), block.Offset, block.Length)
+						fmt.Printf("%s resized block: offset %d len %d\n", time.Now().Format(time.StampNano), block.Offset, block.Length)
 						if block.Length < 1 {
-							fmt.Printf("%s MARK: done with block, discarding\n", time.Now().Format(time.StampNano))
+							fmt.Printf("%s done with block, discarding\n", time.Now().Format(time.StampNano))
 							b := (*statusResults[statusCommand].blocks)[1:]
 							statusResults[statusCommand].blocks = &b
 						}
 					}
 					if len(*statusResults[statusCommand].blocks) == 0 { // All blocks from this status request have been consumed, remove from queue
-						fmt.Printf("%s MARK: block status consumed, removing\n", time.Now().Format(time.StampNano))
+						fmt.Printf("%s block status consumed, removing\n", time.Now().Format(time.StampNano))
 						statusCommands = statusCommands[1:]
 						delete(statusResults, statusCommand)
 					}
 				} else {
-					fmt.Printf("%s MARK: block status running, not yet ready\n", time.Now().Format(time.StampNano))
+					fmt.Printf("%s block status running, not yet ready\n", time.Now().Format(time.StampNano))
 					break // There's a block status command, but it's not ready yet. Break to continue polling
 				}
 			} else {
-				fmt.Printf("%s MARK: no block status in progress\n", time.Now().Format(time.StampNano))
+				fmt.Printf("%s no block status in progress\n", time.Now().Format(time.StampNano))
 				break // No block status commands in progress? Nothing to add to read queue
 			}
 		}
@@ -434,16 +439,15 @@ func AioCopyRange(handle NbdOperations, sink VDDKDataSink, rangeStart, rangeLeng
 		// Write out first ready block, then back to loop so AIO queues don't have to wait on the writes that much
 		//if len(readCommands) > 0 {
 		for _, readCommand := range readCommands {
-			fmt.Printf("%s MARK: read queue ready to go depth %d\n", time.Now().Format(time.StampNano), len(readCommands))
-			//readCommand := readCommands[0]
-			fmt.Printf("%s MARK: got first read command: %v\n", time.Now().Format(time.StampNano), readCommand)
+			fmt.Printf("%s read queue ready to go depth %d\n", time.Now().Format(time.StampNano), len(readCommands))
+			fmt.Printf("%s got first read command: %v\n", time.Now().Format(time.StampNano), readCommand)
 			result := readResults[readCommand]
-			fmt.Printf("%s MARK: got block from read: 0x%p: %v\n", time.Now().Format(time.StampNano), &result, result)
+			fmt.Printf("%s got block from read: 0x%p: %v\n", time.Now().Format(time.StampNano), &result, result)
 			if result.err != nil { // Error reading? Bail out
 				return result.err
 			}
 			if result.ready { // One read result is ready! Write it out
-				fmt.Printf("%s MARK: read result ready! offset %d length %d\n", time.Now().Format(time.StampNano), result.offset, result.length)
+				fmt.Printf("%s read result ready! offset %d length %d\n", time.Now().Format(time.StampNano), result.offset, result.length)
 				if (result.flags & (libnbd.STATE_ZERO | libnbd.STATE_HOLE)) != 0 {
 					skip := ""
 					if (result.flags & libnbd.STATE_HOLE) != 0 {
@@ -463,7 +467,7 @@ func AioCopyRange(handle NbdOperations, sink VDDKDataSink, rangeStart, rangeLeng
 					updateProgress(int(result.length))
 
 					if result.offset+uint64(result.length) >= uint64(rangeEnd) { // Immediately quit after writing out the last expected byte
-						fmt.Println("MARK: finished transfer?")
+						fmt.Println("finished transfer?")
 						return nil
 					}
 
@@ -481,13 +485,13 @@ func AioCopyRange(handle NbdOperations, sink VDDKDataSink, rangeStart, rangeLeng
 							fmt.Printf("%s %v\n", time.Now().Format(time.StampNano), fmt.Errorf("failed to write data block at offset %d to local file: %v", writeOffset, err))
 							return err
 						}
-						fmt.Printf("%s MARK: wrote out %d bytes to offset %d\n", time.Now().Format(time.StampNano), written, writeOffset)
+						fmt.Printf("%s wrote out %d bytes to offset %d\n", time.Now().Format(time.StampNano), written, writeOffset)
 						updateProgress(written)
 						count += int64(written)
 					}
 					result.buffer.Free()
 					if result.offset+uint64(result.length) >= uint64(rangeEnd) { // Immediately quit after writing out the last expected byte
-						fmt.Println("MARK: finished transfer?")
+						fmt.Println("finished transfer?")
 						return nil
 					}
 
@@ -498,39 +502,23 @@ func AioCopyRange(handle NbdOperations, sink VDDKDataSink, rangeStart, rangeLeng
 				break
 			}
 		}
-		//nextIsVirtual := false
-		nextReadIsDone := false
-		if len(readCommands) > 0 {
-			readCommand := readCommands[0]
-			flags := readResults[readCommand].flags
-			if (flags & (libnbd.STATE_ZERO | libnbd.STATE_HOLE)) != 0 { // If the next read command is a virtual one, do not poll
-				fmt.Printf("%s MARK: next read command is virtual, do not poll\n", time.Now().Format(time.StampNano))
-				//nextIsVirtual = true
-				continue
-			}
-			nextReadIsDone, _ = handle.AioCommandCompleted(readCommand)
-		}
-		nextStatusIsdone := false
-		if len(statusCommands) > 0 {
-			statusCommand := statusCommands[0]
-			nextStatusIsdone, _ = handle.AioCommandCompleted(statusCommand)
-		}
+
 		// Poll for any events from block status or pread
-		//if (len(readCommands) > 0 && !nextIsVirtual) || len(statusCommands) > 0 {
-		fmt.Printf("%s MARK: poll decision read commands: %d status commands %d, next read done %t, next status done %t\n", time.Now().Format(time.StampNano), len(readCommands), len(statusCommands), nextReadIsDone, nextStatusIsdone)
-		if nextStatusIsdone || nextReadIsDone {
-			fmt.Printf("%s MARK: next command is ready, do not poll\n", time.Now().Format(time.StampNano))
-			continue
+		inflight, err := handle.AioInFlight()
+		if err != nil {
+			fmt.Printf("%s failed to check for in-flight AIO commands: %v", time.Now().Format(time.StampNano), err)
 		}
-		if len(readCommands) > 0 || len(statusCommands) > 0 {
-			fmt.Printf("%s MARK: polling for status/read events\n", time.Now().Format(time.StampNano))
+		if inflight > 0 {
+			fmt.Printf("%s polling for status/read events, %d in flight\n", time.Now().Format(time.StampNano), inflight)
 			result, err := handle.Poll(int((10 * time.Minute).Milliseconds())) // Does this really stop and wait? Not much waiting seems to be happening
 			if err != nil {
 				return err
 			}
 			if result == 0 {
-				return fmt.Errorf("MARK: timed out waiting for poll at status offset %d", statusOffset)
+				return fmt.Errorf("timed out waiting for poll at status offset %d", statusOffset)
 			}
+		} else {
+			fmt.Printf("%s no commands in-flight, do not poll\n", time.Now().Format(time.StampNano))
 		}
 	}
 }
