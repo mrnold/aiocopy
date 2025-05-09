@@ -47,6 +47,11 @@ func createVddkDataSink(destinationFile string, size uint64) (VDDKDataSink, erro
 		return nil, err
 	}
 
+	err = unix.Fadvise(int(file.Fd()), 0, int64(size), unix.FADV_SEQUENTIAL)
+	if err != nil {
+		fmt.Printf("%s Failed to fadvise sequential access: %v", time.Now().Format(time.StampNano), err)
+	}
+
 	writer := bufio.NewWriter(file)
 	sink := &VDDKFileSink{
 		file:    file,
@@ -200,7 +205,8 @@ type AioReadResult struct {
 	ready  bool
 }
 
-// CreateBlockUpdateCallback creates a list of block status results and a BlockStatus callback that fills out that list
+// CreateBlockUpdateCallback creates a list of block status results and a
+// BlockStatus callback that fills out that list when called by libnbd.
 func CreateBlockUpdateCallback() (*[]*BlockStatusData, func(string, uint64, []uint32, *int) int) {
 	blocks := []*BlockStatusData{}
 
@@ -306,7 +312,8 @@ func CreatePreadArguments(result *AioReadResult) *libnbd.AioPreadOptargs {
 	}
 }
 
-// CopyRange takes one data block, checks if it is a hole or filled with zeroes, and copies it to the sink
+// AioCopyRange runs block status and pread commands asynchronously and writes
+// disk data out to the destination.
 func AioCopyRange(handle NbdOperations, sink VDDKDataSink, rangeStart, rangeLength int64, updateProgress func(int)) error {
 	rangeEnd := rangeStart + rangeLength
 	statusLength := uint64(min(rangeLength, MaxBlockStatusLength)) // Current request length, only changes when it needs to be shrunk for final block
@@ -315,7 +322,7 @@ func AioCopyRange(handle NbdOperations, sink VDDKDataSink, rangeStart, rangeLeng
 	// Read request tracking
 	readCommands := []uint64{}
 	readResults := map[uint64]*AioReadResult{}
-	readDepth := 16 // Maximum concurrent downloads
+	readDepth := 4 // Maximum concurrent downloads
 
 	// Block status tracking
 	statusCommands := []uint64{}                        // Queue of block status command cookies
@@ -799,7 +806,7 @@ func main() {
 	}
 
 	//diskSize = 25769803776
-	diskSize, err := handle.GetSize()
+	diskSize, err = handle.GetSize()
 	if err != nil {
 		fmt.Printf("Unable to get NBD size: %v\n", err)
 		return
@@ -816,21 +823,21 @@ func main() {
 	initialProgressTime = time.Now()
 	fmt.Printf("%s is the starting timestamp\n", initialProgressTime.Format(time.StampNano))
 
-	// err = AioCopyRange(handle, sink, 0, int64(diskSize), updateProgress)
+	err = AioCopyRange(handle, sink, 0, int64(diskSize), updateProgress)
+	if err != nil {
+		fmt.Printf("%s Failed to Aio copy range: %v\n", time.Now(), err)
+	}
+
+	// err = SyncCopy(handle, sink, 0, int64(diskSize), updateProgress)
 	// if err != nil {
-	// 	fmt.Printf("%s Failed to Aio copy range: %v\n", time.Now(), err)
+	// 	fmt.Printf("%s Failed to copy synchronously: %v\n", time.Now().Format(time.StampNano), err)
 	// }
 
-	//err = SyncCopy(handle, sink, 0, int64(diskSize), updateProgress)
-	//if err != nil {
-	//fmt.Printf("%s Failed to copy synchronously: %v\n", time.Now().Format(time.StampNano), err)
-	//}
-
-	err = DumbCopy(handle, sink, 0, int64(diskSize), updateProgress)
-	if err != nil {
-		fmt.Printf("%s Failed to copy dumbly: %v\n", time.Now().Format(time.StampNano), err)
-		return
-	}
+	// err = DumbCopy(handle, sink, 0, int64(diskSize), updateProgress)
+	// if err != nil {
+	// 	fmt.Printf("%s Failed to copy dumbly: %v\n", time.Now().Format(time.StampNano), err)
+	// 	return
+	// }
 
 	doneTime := time.Now()
 	elapsed := doneTime.Sub(initialProgressTime).Seconds()
