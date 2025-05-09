@@ -47,11 +47,6 @@ func createVddkDataSink(destinationFile string, size uint64) (VDDKDataSink, erro
 		return nil, err
 	}
 
-	err = unix.Fadvise(int(file.Fd()), 0, int64(size), unix.FADV_SEQUENTIAL)
-	if err != nil {
-		fmt.Printf("%s Failed to fadvise sequential access: %v", time.Now().Format(time.StampNano), err)
-	}
-
 	writer := bufio.NewWriter(file)
 	sink := &VDDKFileSink{
 		file:    file,
@@ -327,7 +322,7 @@ func AioCopyRange(handle NbdOperations, sink VDDKDataSink, rangeStart, rangeLeng
 	// Read request tracking
 	readCommands := []uint64{}
 	readResults := map[uint64]*AioReadResult{}
-	readDepth := 8 // Maximum concurrent downloads
+	readDepth := 4 // Maximum concurrent downloads
 
 	// Block status tracking
 	statusCommands := []uint64{}                        // Queue of block status command cookies
@@ -509,11 +504,13 @@ func AioCopyRange(handle NbdOperations, sink VDDKDataSink, rangeStart, rangeLeng
 			fmt.Printf("%s failed to check for in-flight AIO commands: %v", time.Now().Format(time.StampNano), err)
 		}
 		if inflight > 0 {
+			polltime := time.Now()
 			fmt.Printf("%s polling for status/read events, %d in flight\n", time.Now().Format(time.StampNano), inflight)
 			result, err := handle.Poll(int((10 * time.Minute).Milliseconds())) // Does this really stop and wait? Not much waiting seems to be happening
 			if err != nil {
 				return err
 			}
+			fmt.Printf("%s poll waited %s to get an event\n", time.Now().Format(time.StampNano), time.Since(polltime))
 			if result == 0 {
 				return fmt.Errorf("timed out waiting for poll at status offset %d", statusOffset)
 			}
