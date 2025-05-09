@@ -520,6 +520,132 @@ func AioCopyRange(handle NbdOperations, sink VDDKDataSink, rangeStart, rangeLeng
 	}
 }
 
+// AioCopyRangeNoStatus runs pread commands asynchronously and writes // disk data out to the destination.
+func AioCopyRangeNoStatus(handle NbdOperations, sink VDDKDataSink, rangeStart, rangeLength int64, updateProgress func(int)) error {
+	rangeEnd := rangeStart + rangeLength
+
+	// Read request tracking
+	readCommands := []uint64{}
+	readResults := map[uint64]*AioReadResult{}
+	readDepth := 4 // Maximum concurrent downloads
+
+	readOffset := int64(0)
+
+	for {
+		fmt.Printf("%s start polling loop, read queue %d, read offset %d\n", time.Now().Format(time.StampNano), len(readCommands), readOffset)
+
+		// Read block
+		for len(readCommands) < readDepth { // Read queue is not full, check if there's a block status command to consume
+			var readCommand uint64
+			var err error
+
+			// Need to break buffer down into maximum pread-sized chunks,
+			// removing chunks so that it can continue with this buffer
+			// on the next loop when the queue is too full to handle all of them
+			var result AioReadResult
+			readSize := min(uint(rangeLength-readOffset), uint(MaxPreadLength))
+			result.buffer = libnbd.MakeAioBuffer(readSize)
+			result.length = int64(readSize)
+			result.offset = uint64(readOffset)
+			readArguments := CreatePreadArguments(&result)
+			fmt.Printf("%s issuing AIO pread at offset %d length %d\n", time.Now().Format(time.StampNano), result.offset, result.length)
+			readCommand, err = handle.AioPread(result.buffer, result.offset, readArguments)
+			if err != nil {
+				return err
+			}
+			readCommands = append(readCommands, readCommand)
+			readResults[readCommand] = &result
+			readOffset += int64(readSize)
+		}
+
+		// Write out first ready block, then back to loop so AIO queues don't have to wait on the writes that much
+		for _, readCommand := range readCommands {
+			fmt.Printf("%s read queue ready to go depth %d\n", time.Now().Format(time.StampNano), len(readCommands))
+			fmt.Printf("%s got first read command: %v\n", time.Now().Format(time.StampNano), readCommand)
+			result := readResults[readCommand]
+			fmt.Printf("%s got block from read: 0x%p: %v\n", time.Now().Format(time.StampNano), &result, result)
+			if result.err != nil { // Error reading? Bail out
+				return result.err
+			}
+			if result.ready { // One read result is ready! Write it out
+				fmt.Printf("%s read result ready! offset %d length %d\n", time.Now().Format(time.StampNano), result.offset, result.length)
+				if (result.flags & (libnbd.STATE_ZERO | libnbd.STATE_HOLE)) != 0 {
+					skip := ""
+					if (result.flags & libnbd.STATE_HOLE) != 0 {
+						skip = "hole"
+					}
+					if (result.flags & libnbd.STATE_ZERO) != 0 {
+						if skip != "" {
+							skip += "/"
+						}
+						skip += "zero block"
+					}
+					fmt.Printf("%s Found a %d-byte %s at offset %d, filling destination with zeroes.\n", time.Now().Format(time.StampNano), result.length, skip, result.offset)
+					dataSize -= uint64(result.length)
+					if err := sink.ZeroRange(int64(result.offset), result.length); err != nil {
+						return err
+					}
+					updateProgress(int(result.length))
+
+					if result.offset+uint64(result.length) >= uint64(rangeEnd) { // Immediately quit after writing out the last expected byte
+						fmt.Println("finished transfer?")
+						return nil
+					}
+
+					readCommands = readCommands[1:] // Pop this read result off the queue
+					delete(readResults, readCommand)
+
+					continue // Avoid polling after servicing a virtual command
+				} else {
+					count := int64(0)
+					for count < int64(result.buffer.Size) {
+						buffer := result.buffer.Bytes()[count:]
+						writeOffset := result.offset + uint64(count)
+						written, err := sink.Pwrite(buffer, writeOffset)
+						if err != nil {
+							fmt.Printf("%s %v\n", time.Now().Format(time.StampNano), fmt.Errorf("failed to write data block at offset %d to local file: %v", writeOffset, err))
+							return err
+						}
+						fmt.Printf("%s wrote out %d bytes to offset %d\n", time.Now().Format(time.StampNano), written, writeOffset)
+						updateProgress(written)
+						count += int64(written)
+					}
+					result.buffer.Free()
+					if result.offset+uint64(result.length) >= uint64(rangeEnd) { // Immediately quit after writing out the last expected byte
+						fmt.Println("finished transfer?")
+						return nil
+					}
+
+					readCommands = readCommands[1:] // Pop this read result off the queue
+					delete(readResults, readCommand)
+				}
+			} else { // The next result isn't ready, break and find more work to do
+				break
+			}
+		}
+
+		// Poll for any events from block status or pread
+		inflight, err := handle.AioInFlight()
+		if err != nil {
+			fmt.Printf("%s failed to check for in-flight AIO commands: %v", time.Now().Format(time.StampNano), err)
+		}
+		if inflight > 0 {
+			polltime := time.Now()
+			fmt.Printf("%s polling for status/read events, %d in flight\n", time.Now().Format(time.StampNano), inflight)
+			result, err := handle.Poll(int((10 * time.Minute).Milliseconds())) // Does this really stop and wait? Not much waiting seems to be happening
+			if err != nil {
+				return err
+			}
+			fmt.Printf("%s poll waited %s to get an event\n", time.Now().Format(time.StampNano), time.Since(polltime))
+			if result == 0 {
+				return fmt.Errorf("timed out waiting for poll at read offset %d", readOffset)
+			}
+		} else {
+			fmt.Printf("%s no commands in-flight, do not poll\n", time.Now().Format(time.StampNano))
+		}
+	}
+}
+
 type DiskChangeExtent struct {
 	Length int64
 	Start  int64
@@ -808,7 +934,12 @@ func main() {
 	initialProgressTime = time.Now()
 	fmt.Printf("%s is the starting timestamp\n", initialProgressTime.Format(time.StampNano))
 
-	err = AioCopyRange(handle, sink, 0, int64(diskSize), updateProgress)
+	// err = AioCopyRange(handle, sink, 0, int64(diskSize), updateProgress)
+	// if err != nil {
+	// 	fmt.Printf("%s Failed to Aio copy range: %v\n", time.Now(), err)
+	// }
+
+	err = AioCopyRangeNoStatus(handle, sink, 0, int64(diskSize), updateProgress)
 	if err != nil {
 		fmt.Printf("%s Failed to Aio copy range: %v\n", time.Now(), err)
 	}
