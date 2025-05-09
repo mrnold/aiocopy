@@ -105,25 +105,25 @@ func (sink *VDDKFileSink) ZeroRange(offset int64, length int64) error {
 	}
 
 	if err != nil { // Fall back to regular pwrite
-		//fmt.Printf("%s Unable to zero range %d - %d on destination, falling back to pwrite: %v\n", time.Now().Format(time.StampNano), offset, offset+length, err)
-		fmt.Printf("%s MARK: Unable to zero range %d - %d on destination, avoiding write for test %v\n", time.Now().Format(time.StampNano), offset, offset+length, err)
-		return nil
-		// err = nil
-		// count := int64(0)
-		// const blocksize = 16 << 20
-		// buffer := bytes.Repeat([]byte{0}, blocksize)
-		// for count < length {
-		// 	remaining := length - count
-		// 	if remaining < blocksize {
-		// 		buffer = bytes.Repeat([]byte{0}, int(remaining))
-		// 	}
-		// 	written, err := sink.Pwrite(buffer, uint64(offset))
-		// 	if err != nil {
-		// 		fmt.Printf("%s Unable to write %d zeroes at offset %d: %v\n", time.Now().Format(time.StampNano), length, offset, err)
-		// 		break
-		// 	}
-		// 	count += int64(written)
-		// }
+		fmt.Printf("%s Unable to zero range %d - %d on destination, falling back to pwrite: %v\n", time.Now().Format(time.StampNano), offset, offset+length, err)
+		//fmt.Printf("%s MARK: Unable to zero range %d - %d on destination, avoiding write for test %v\n", time.Now().Format(time.StampNano), offset, offset+length, err)
+		//return nil
+		err = nil
+		count := int64(0)
+		const blocksize = 16 << 20
+		buffer := bytes.Repeat([]byte{0}, blocksize)
+		for count < length {
+			remaining := length - count
+			if remaining < blocksize {
+				buffer = bytes.Repeat([]byte{0}, int(remaining))
+			}
+			written, err := sink.Pwrite(buffer, uint64(offset))
+			if err != nil {
+				fmt.Printf("%s Unable to write %d zeroes at offset %d: %v\n", time.Now().Format(time.StampNano), length, offset, err)
+				break
+			}
+			count += int64(written)
+		}
 	}
 
 	return err
