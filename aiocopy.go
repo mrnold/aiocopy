@@ -316,6 +316,10 @@ func CreatePreadArguments(result *AioReadResult) *libnbd.AioPreadOptargs {
 // disk data out to the destination.
 func AioCopyRange(handle NbdOperations, sink VDDKDataSink, rangeStart, rangeLength int64, updateProgress func(int)) error {
 	rangeEnd := rangeStart + rangeLength
+
+	// Block status tracking
+	statusCommands := []uint64{}                                   // Queue of block status command cookies
+	statusResults := map[uint64]*AioBlockStatusResult{}            // Map of block status command cookies to results
 	statusLength := uint64(min(rangeLength, MaxBlockStatusLength)) // Current request length, only changes when it needs to be shrunk for final block
 	statusOffset := uint64(rangeStart)                             // Current status offset, does not necessarily advance by statusLength every time!
 
@@ -323,10 +327,6 @@ func AioCopyRange(handle NbdOperations, sink VDDKDataSink, rangeStart, rangeLeng
 	readCommands := []uint64{}
 	readResults := map[uint64]*AioReadResult{}
 	readDepth := 4 // Maximum concurrent downloads
-
-	// Block status tracking
-	statusCommands := []uint64{}                        // Queue of block status command cookies
-	statusResults := map[uint64]*AioBlockStatusResult{} // Map of block status command cookies to results
 
 	for {
 		fmt.Printf("%s start polling loop, status queue %d, read queue %d, status offset %d\n", time.Now().Format(time.StampNano), len(statusCommands), len(readCommands), statusOffset)
@@ -345,7 +345,9 @@ func AioCopyRange(handle NbdOperations, sink VDDKDataSink, rangeStart, rangeLeng
 			statusCommands = append(statusCommands, command)
 			statusResults[command] = result
 		}
-		if len(statusCommands) > 0 { // When a block status result is ready, advance the offset of the next block status command
+
+		// When a block status result is ready, advance the offset of the next block status command
+		if len(statusCommands) > 0 {
 			lastStatusCommand := statusCommands[len(statusCommands)-1]
 			lastStatusResult := statusResults[lastStatusCommand]
 			if lastStatusResult.ready && len(*lastStatusResult.blocks) > 0 {
@@ -358,82 +360,80 @@ func AioCopyRange(handle NbdOperations, sink VDDKDataSink, rangeStart, rangeLeng
 
 		// Read block
 		for len(readCommands) < readDepth { // Read queue is not full, check if there's a block status command to consume
-			if len(statusCommands) > 0 { // There's a block status statusCommand going, check if it's done
-				statusCommand := statusCommands[0]           // Always take the first one to service them in order
-				if statusResults[statusCommand].err != nil { // Block status failed! Bail out? Or TODO copy whole block instead?
-					return statusResults[statusCommand].err
-				}
-				if statusResults[statusCommand].ready { // Block status command is ready! Issue some reads
-					fmt.Printf("%s AIO block status command ready! Inspecting returned blocks %p: %v\n", time.Now().Format(time.StampNano), &(statusResults[statusCommand].blocks), statusResults[statusCommand].blocks)
-					block := (*statusResults[statusCommand].blocks)[0]
+			if len(statusCommands) < 1 { // No status commands to check
+				break
+			}
+			statusCommand := statusCommands[0]           // Always take the first one to service them in order
+			if statusResults[statusCommand].err != nil { // Block status failed! Bail out? Or TODO copy whole block instead?
+				return statusResults[statusCommand].err
+			}
+			if statusResults[statusCommand].ready { // Block status command is ready! Issue some reads
+				fmt.Printf("%s AIO block status command ready! Inspecting returned blocks %p: %v\n", time.Now().Format(time.StampNano), &(statusResults[statusCommand].blocks), statusResults[statusCommand].blocks)
+				block := (*statusResults[statusCommand].blocks)[0]
 
-					if (block.Flags & (libnbd.STATE_ZERO | libnbd.STATE_HOLE)) != 0 { // If the range is empty, add a fake result for the write out later
-						fmt.Printf("%s spoofing read command for empty range\n", time.Now().Format(time.StampNano))
-						result := AioReadResult{
-							length: block.Length,
-							offset: uint64(block.Offset),
-							flags:  block.Flags, // Writer will check this later
-							ready:  true,
-						}
+				if (block.Flags & (libnbd.STATE_ZERO | libnbd.STATE_HOLE)) != 0 { // If the range is empty, add a fake result for the write out later
+					fmt.Printf("%s spoofing read command for empty range\n", time.Now().Format(time.StampNano))
+					result := AioReadResult{
+						length: block.Length,
+						offset: uint64(block.Offset),
+						flags:  block.Flags, // Writer will check this later
+						ready:  true,
+					}
 
-						// Borrow status cookie and use it in the read command list,
-						// because it is unique per libnbd handle and there is no
-						// AioPread to generate a new one here.
-						readCommand := statusCommand
+					// Borrow status cookie and use it in the read command list,
+					// because it is unique per libnbd handle and there is no
+					// AioPread to generate a new one here.
+					readCommand := statusCommand
 
-						readCommands = append(readCommands, readCommand)
-						readResults[readCommand] = &result
+					readCommands = append(readCommands, readCommand)
+					readResults[readCommand] = &result
+					b := (*statusResults[statusCommand].blocks)[1:]
+					statusResults[statusCommand].blocks = &b
+				} else { // Range is not empty, issue a real read
+					var readCommand uint64
+					var err error
+
+					// Need to break buffer down into maximum pread-sized chunks,
+					// removing chunks so that it can continue with this buffer
+					// on the next loop when the queue is too full to handle all of them
+					var result AioReadResult
+					readSize := min(uint(block.Length), uint(MaxPreadLength))
+					result.buffer = libnbd.MakeAioBuffer(readSize)
+					result.length = int64(readSize)
+					result.offset = uint64(block.Offset)
+					readArguments := CreatePreadArguments(&result)
+					fmt.Printf("%s issuing AIO pread at offset %d length %d\n", time.Now().Format(time.StampNano), result.offset, result.length)
+					readCommand, err = handle.AioPread(result.buffer, result.offset, readArguments)
+					if err != nil {
+						return err
+					}
+					readCommands = append(readCommands, readCommand)
+					readResults[readCommand] = &result
+
+					fmt.Printf("%s advancing block, offset %d len %d bump %d bytes\n", time.Now().Format(time.StampNano), block.Offset, block.Length, readSize)
+					block.Offset = block.Offset + int64(readSize)
+					block.Length = block.Length - int64(readSize)
+					fmt.Printf("%s resized block: offset %d len %d\n", time.Now().Format(time.StampNano), block.Offset, block.Length)
+					if block.Length < 1 {
+						fmt.Printf("%s done with block, discarding\n", time.Now().Format(time.StampNano))
 						b := (*statusResults[statusCommand].blocks)[1:]
 						statusResults[statusCommand].blocks = &b
-					} else { // Range is not empty, issue a real read
-						var readCommand uint64
-						var err error
-
-						// Need to break buffer down into maximum pread-sized chunks,
-						// removing chunks so that it can continue with this buffer
-						// on the next loop when the queue is too full to handle all of them
-						var result AioReadResult
-						readSize := min(uint(block.Length), uint(MaxPreadLength))
-						result.buffer = libnbd.MakeAioBuffer(readSize)
-						result.length = int64(readSize)
-						result.offset = uint64(block.Offset)
-						readArguments := CreatePreadArguments(&result)
-						fmt.Printf("%s issuing AIO pread at offset %d length %d\n", time.Now().Format(time.StampNano), result.offset, result.length)
-						readCommand, err = handle.AioPread(result.buffer, result.offset, readArguments)
-						if err != nil {
-							return err
-						}
-						readCommands = append(readCommands, readCommand)
-						readResults[readCommand] = &result
-
-						fmt.Printf("%s advancing block, offset %d len %d bump %d bytes\n", time.Now().Format(time.StampNano), block.Offset, block.Length, readSize)
-						block.Offset = block.Offset + int64(readSize)
-						block.Length = block.Length - int64(readSize)
-						fmt.Printf("%s resized block: offset %d len %d\n", time.Now().Format(time.StampNano), block.Offset, block.Length)
-						if block.Length < 1 {
-							fmt.Printf("%s done with block, discarding\n", time.Now().Format(time.StampNano))
-							b := (*statusResults[statusCommand].blocks)[1:]
-							statusResults[statusCommand].blocks = &b
-						}
 					}
-					if len(*statusResults[statusCommand].blocks) == 0 { // All blocks from this status request have been consumed, remove from queue
-						fmt.Printf("%s block status consumed, removing\n", time.Now().Format(time.StampNano))
-						statusCommands = statusCommands[1:]
-						delete(statusResults, statusCommand)
-					}
-				} else {
-					fmt.Printf("%s block status running, not yet ready\n", time.Now().Format(time.StampNano))
-					break // There's a block status command, but it's not ready yet. Break to continue polling
+				}
+				if len(*statusResults[statusCommand].blocks) == 0 { // All blocks from this status request have been consumed, remove from queue
+					fmt.Printf("%s block status consumed, removing\n", time.Now().Format(time.StampNano))
+					statusCommands = statusCommands[1:]
+					delete(statusResults, statusCommand)
 				}
 			} else {
-				fmt.Printf("%s no block status in progress\n", time.Now().Format(time.StampNano))
-				break // No block status commands in progress? Nothing to add to read queue
+				fmt.Printf("%s block status running, not yet ready\n", time.Now().Format(time.StampNano))
+				break // There's a block status command, but it's not ready yet. Break to continue polling
 			}
 		}
 
 		// Write out first ready block, then back to loop so AIO queues don't have to wait on the writes that much
-		//if len(readCommands) > 0 {
-		for _, readCommand := range readCommands {
+		if len(readCommands) > 0 {
+			readCommand := readCommands[0]
 			fmt.Printf("%s read queue ready to go depth %d\n", time.Now().Format(time.StampNano), len(readCommands))
 			fmt.Printf("%s got first read command: %v\n", time.Now().Format(time.StampNano), readCommand)
 			result := readResults[readCommand]
@@ -461,15 +461,6 @@ func AioCopyRange(handle NbdOperations, sink VDDKDataSink, rangeStart, rangeLeng
 					}
 					updateProgress(int(result.length))
 
-					if result.offset+uint64(result.length) >= uint64(rangeEnd) { // Immediately quit after writing out the last expected byte
-						fmt.Println("finished transfer?")
-						return nil
-					}
-
-					readCommands = readCommands[1:] // Pop this read result off the queue
-					delete(readResults, readCommand)
-
-					continue // Avoid polling after servicing a virtual command
 				} else {
 					count := int64(0)
 					for count < int64(result.buffer.Size) {
@@ -485,16 +476,14 @@ func AioCopyRange(handle NbdOperations, sink VDDKDataSink, rangeStart, rangeLeng
 						count += int64(written)
 					}
 					result.buffer.Free()
-					if result.offset+uint64(result.length) >= uint64(rangeEnd) { // Immediately quit after writing out the last expected byte
-						fmt.Println("finished transfer?")
-						return nil
-					}
-
-					readCommands = readCommands[1:] // Pop this read result off the queue
-					delete(readResults, readCommand)
 				}
-			} else { // The next result isn't ready, break and find more work to do
-				break
+
+				if result.offset+uint64(result.length) >= uint64(rangeEnd) { // Immediately quit after writing out the last expected byte
+					fmt.Println("finished transfer?")
+					return nil
+				}
+				readCommands = readCommands[1:] // Pop this read result off the queue
+				delete(readResults, readCommand)
 			}
 		}
 
@@ -934,15 +923,15 @@ func main() {
 	initialProgressTime = time.Now()
 	fmt.Printf("%s is the starting timestamp\n", initialProgressTime.Format(time.StampNano))
 
-	// err = AioCopyRange(handle, sink, 0, int64(diskSize), updateProgress)
-	// if err != nil {
-	// 	fmt.Printf("%s Failed to Aio copy range: %v\n", time.Now(), err)
-	// }
-
-	err = AioCopyRangeNoStatus(handle, sink, 0, int64(diskSize), updateProgress)
+	err = AioCopyRange(handle, sink, 0, int64(diskSize), updateProgress)
 	if err != nil {
 		fmt.Printf("%s Failed to Aio copy range: %v\n", time.Now(), err)
 	}
+
+	// err = AioCopyRangeNoStatus(handle, sink, 0, int64(diskSize), updateProgress)
+	// if err != nil {
+	// 	fmt.Printf("%s Failed to Aio copy range: %v\n", time.Now(), err)
+	// }
 
 	// err = SyncCopy(handle, sink, 0, int64(diskSize), updateProgress)
 	// if err != nil {
